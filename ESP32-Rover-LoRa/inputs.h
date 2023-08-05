@@ -1,5 +1,5 @@
 // Replace with your network credentials
-const char* ssid = "XXXXX";
+const char* ssid = "XXXXXX";
 const char* password = "XXXXXX";
 
 // IP address of the base station ESP32

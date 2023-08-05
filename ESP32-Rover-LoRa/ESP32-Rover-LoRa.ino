@@ -169,7 +169,7 @@ void setup()
     connectWiFi();
 
     // Software serial connection to RP2040
-    tinkernav_serial.begin(57600, SWSERIAL_8N1, 0, 1);
+    tinkernav_serial.begin(9600, SWSERIAL_8N1, 0, 1);
     transferFromNav.begin(tinkernav_serial);
 
     // GNSS hardware serial connection

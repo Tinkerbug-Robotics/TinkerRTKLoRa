@@ -33,7 +33,7 @@
 // RTCM parsing variables
 PARSERTCM rtcm_parser;
 char rtcm_data[2500];
-String rtk_rec_mode = "Rover";
+String rtk_rec_mode = "Base Station";
 bool data_available = false;
 unsigned int data_length = 0;
 
@@ -102,7 +102,7 @@ void setup()
     connectWiFi();
 
     // Software serial connection to RP2040
-    tinkernav_serial.begin(57600, SWSERIAL_8N1, 0, 1);
+    tinkernav_serial.begin(9600, SWSERIAL_8N1, 0, 1);
     transferFromNav.begin(tinkernav_serial);
 
     // GNSS hardware serial connection

@@ -1,17 +1,54 @@
 /**
  * Firmware for RP2040 running on the rover to receive correction data directly from a base station 
- * through a LoRa network using the TinkerSend - LoRa radio (LLCC68 based).
+ * through a LoRa network using the TinkerSend - LoRa radio (LLCC68 based). This firmware also reads 
+ * data from TinkerCharge and makes it available to the ESP32 to display on a webpage.
  * This firmware sends RTCM correction data to the rover's the PX112X GNSS receiver, which
  * in turn computes an RTK solution for hte rover.
+ *  * !!! Note this must be compiled with the Earle Philhower RP2040 board set !!!
  * Copyright Tinkerbug Robotics 2023
  * Provided under GNU GPL 3.0 License
  */
 
-// Radio library for working with radio
-#include <RadioLib.h>
+ // !!! Note this must be compiled with the Earle Philhower RP2040 board set !!!
 
-// Used for hardware serial on GPIO pins
-#include <Arduino.h>
+#include "Arduino.h"
+#include <RadioLib.h>
+#include <Wire.h>
+#include "SerialTransfer.h"
+#include <SoftwareSerial.h>
+#include "pico/stdlib.h"
+#include <MAX17055_TR.h>
+#include <SPI.h>
+
+// Serial connection to ESP32 radio (RX, TX)
+SoftwareSerial swSerial(20, 3);
+
+// Library and structure for transfering data to TinkerSend radio
+SerialTransfer radioTransfer;
+struct STRUCT 
+{
+    float voltage;
+    float avg_voltage;
+    float current;
+    float avg_current;
+    float battery_capacity;
+    float battery_age;
+    float cycle_counter;
+    float SOC;
+    float temperature;
+} dataForTinkerSend;
+
+// MAX17055 Battery Fuel Cell Gauge
+
+// I2C pins
+#define SDA 26
+#define SCL 27
+
+MAX17055 max17055;
+
+// Timer to write SOC data on a specified periodic (ms)
+unsigned long last_soc_time = 0;
+int soc_periodic = 2000;
 
 // RP2040 pins for LoRa radio
 #define L_DIO1 6
@@ -35,10 +72,10 @@ LLCC68* radio;
 #define MAX_MSG_LENGTH 1024
 
 // Create SPI instance for the LoRa radio pins
-arduino::MbedSPI SPI1(L_MISO, L_MOSI, L_SCK);
+//arduino::MbedSPI SPI1(L_MISO, L_MOSI, L_SCK);
 
 // Serial connection to GPS receiver's RXD2 pin that receives correction data
-UART Serial2(4, 5, 0, 0);
+//UART Serial2(4, 5, 0, 0);
 
 // Flag to indicate that a packet was received
 volatile bool receivedFlag = false;
@@ -58,7 +95,34 @@ void setup()
     Serial.println("Starting LLCC68 Radio ...");
     
     // Start SPI for LoRa radio
+    // Set SPI pins for the radio's SPI
+    SPI1.setRX(L_MISO);
+    SPI1.setTX(L_MOSI);
+    SPI1.setCS(L_SS);
+    SPI1.setSCK(L_SCK);
     SPI1.begin();
+
+    // Serial connection to GPS receiver's RXD2 pin that receives correction data
+    Serial2.setTX(4);
+    Serial2.setRX(5);
+    Serial2.begin(115200);
+
+    // Radio serial connection
+    swSerial.begin(9600);
+    radioTransfer.begin(swSerial);
+
+    // Set I2C pins for communicating with MAX17055
+    Wire1.setSDA(SDA);
+    Wire1.setSCL(SCL);
+    Wire1.begin();
+
+    // Configure MAX17055
+    max17055.setResistSensor(0.01); 
+    max17055.setCapacity(4400);
+    max17055.setChargeTermination(44);
+    max17055.setEmptyVoltage(3.3);
+
+    last_soc_time = millis();
     
     // Configure and create instance of LoRa radio
     mod = new Module(L_SS,L_DIO1,L_RST,L_BUSY,SPI1);
@@ -117,7 +181,6 @@ void setup()
 
     // Start serial connections to send correction data to GNSS receiver
     Serial1.begin(115200);
-    Serial2.begin(115200);
   
     Serial.println("Setup complete");
 }
@@ -130,6 +193,15 @@ void loop()
     // Read RTCM correction data from LoRa radio and send to GNSS receiver
     // for it to use in making RTK corrections
     readAndSendRTCMData();
+
+    unsigned long current_time = millis();
+    // Periodically write SOC data to ESP32
+    if (current_time > last_soc_time + soc_periodic || last_soc_time > current_time)
+    { 
+        //Serial.println(millis());
+        readAndSendSOC();
+        last_soc_time = current_time;
+    }
 }
 
 // Read RTCM correction data from the LoRa radio on the base station and send it
@@ -201,4 +273,37 @@ void readAndSendNMEAData()
         char ch = Serial1.read();
         Serial.write(ch);
     }
+}
+
+// Read and send state of charge (SOC) data to ESP32
+void readAndSendSOC()
+{
+    // Read data and pack into structure
+    dataForTinkerSend.voltage = max17055.getInstantaneousVoltage();
+    dataForTinkerSend.avg_voltage = max17055.getAvgVoltage();
+    dataForTinkerSend.current = max17055.getInstantaneousCurrent();
+    dataForTinkerSend.avg_current = max17055.getAvgCurrent();
+    dataForTinkerSend.battery_capacity = max17055.getCalculatedCapacity();
+    dataForTinkerSend.battery_age = max17055.getBatteryAge();
+    dataForTinkerSend.cycle_counter = max17055.getChargeCycle();
+    dataForTinkerSend.SOC = max17055.getSOC();
+    dataForTinkerSend.temperature = max17055.getTemp();
+
+//    Serial.println("");
+//    Serial.print("Voltage: ");Serial.println(dataForTinkerSend.voltage);
+//    Serial.print("Avg Voltage: ");Serial.println(dataForTinkerSend.avg_voltage);
+//    Serial.print("Current: ");Serial.println(dataForTinkerSend.current);
+//    Serial.print("Avg Current: ");Serial.println(dataForTinkerSend.avg_current);
+//    Serial.print("Battery Capactity: ");Serial.println(dataForTinkerSend.battery_capacity);
+//    Serial.print("Battery Age: ");Serial.println(dataForTinkerSend.battery_age);
+//    Serial.print("Number of Cycles: ");Serial.println(dataForTinkerSend.cycle_counter);
+//    Serial.print("SOC: ");Serial.println(dataForTinkerSend.SOC);
+//    Serial.print("Temperature: ");Serial.println(dataForTinkerSend.temperature);
+//    Serial.println("------------------------------------------------------------");
+    
+    uint16_t sendSize = 0;
+
+    // Send data to TinkerSend radio using serial connection
+    sendSize = radioTransfer.txObj(dataForTinkerSend,sendSize);
+    radioTransfer.sendData(sendSize);
 }
