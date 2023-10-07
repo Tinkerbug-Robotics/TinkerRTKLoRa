@@ -19,6 +19,9 @@
 #include "pico/stdlib.h"
 #include <MAX17055_TR.h>
 #include <SPI.h>
+#include "programSkyTraq.h"
+
+programSkyTraq program_skytraq;
 
 // Serial connection to ESP32 radio (RX, TX)
 SoftwareSerial swSerial(20, 3);
@@ -181,6 +184,22 @@ void setup()
 
     // Start serial connections to send correction data to GNSS receiver
     Serial1.begin(115200);
+
+    // Initialze library to program SkyTraq
+    program_skytraq.init(Serial1);
+
+    // GNSS input/output Serial is Serial1 using default 0,1 (TX, RX) pins
+    // Loop through valid baud rates and determine the current setting
+    // Set Serial1 to the detected baud rate, stop if a baud rate is not found
+    // From NavSpark binary protocol. Search for "SkyTrq Application Note AN0037"
+    // Currently available at: https://www.navsparkforum.com.tw/download/file.php?id=1162&sid=dc2418f065ec011e1b27cfa77bf22b19
+    if(!autoSetBaudRate())
+    {
+        Serial.println("No valid baud rate found to talk to receiver, stopping");
+        while(1);
+    }
+    
+    delay(250);
   
     Serial.println("Setup complete");
 }
@@ -306,4 +325,50 @@ void readAndSendSOC()
     // Send data to TinkerSend radio using serial connection
     sendSize = radioTransfer.txObj(dataForTinkerSend,sendSize);
     radioTransfer.sendData(sendSize);
+}
+
+// Loop through valid baud rates for the GNSS receiver and determine the current setting
+bool autoSetBaudRate()
+{
+    // Start serial connections to send correction data to GNSS receiver
+    // This loop will detect the current baud rate of the GNSS receiver
+    // by sending a message and determining which buad rate returns a valid
+    // ACK message
+    int valid_baud_rates[9] = {4800, 9600, 19200, 38400, 57600, 115200, 
+                               230400, 460800, 921600};
+
+    // Message to reset receiver to defaults
+    uint8_t res_payload_length[]={0x00, 0x02};
+    int res_payload_length_length = 2;
+    uint8_t res_msg_id[]={0x04};
+    int res_msg_id_length = 1;
+    uint8_t res_msg_body[]={0x01};
+    int res_msg_body_length = 1;
+
+    // Loop through possible baud rates
+    for (int i=0;i<9;i++)
+    {
+        // Open the serial connection to the receiver
+        Serial1.begin(valid_baud_rates[i]);
+
+        // Send a message to reset receiver to defaults
+        if (program_skytraq.sendGenericMsg(res_msg_id,
+                                           res_msg_id_length,
+                                           res_payload_length,
+                                           res_payload_length_length,
+                                           res_msg_body,
+                                           res_msg_body_length) == 1)
+        {
+            Serial.print("Found correct baud rate of ");
+            Serial.print(valid_baud_rates[i]);
+            Serial.println(" for GNSS receiver");
+            return true;            
+        }               
+        else
+        {
+            Serial1.end();
+        }
+    }
+
+    return false;
 }
