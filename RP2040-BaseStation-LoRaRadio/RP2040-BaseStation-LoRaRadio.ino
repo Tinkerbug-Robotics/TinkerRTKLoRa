@@ -32,24 +32,28 @@
 
 // !!! Note this must be compiled with the Earle Philhower RP2040 board set !!!
 
-#include <Arduino.h>
+#include "Arduino.h"
 #include <RadioLib.h>
 #include <Wire.h>
 #include "SerialTransfer.h"
 #include <SoftwareSerial.h>
-#include <pico/stdlib.h>
-#include <SPI.h>
-
+#include "pico/stdlib.h"
 #include <MAX17055_TR.h>
+#include <SPI.h>
+#include <CRC.h>
+
 #include "programSkyTraq.h"
+
+#include <Arduino.h>
 
 // Configuration for pins is in User_Setup.h in the TFT_eSPI library folder
 #include <TFT_eSPI.h>
 #include <TinyGPSPlus.h>
+#include <TouchScreenTR.h>
+#include <math.h>
 #include <FS.h>
 #include <LittleFS.h>
 
-// Local include file
 #include "TBR_Logo.h"
 
 #define DEBUG false
@@ -74,11 +78,12 @@ struct STRUCT
     float temperature;
 } dataForTinkerSend;
 
+// MAX17055 Battery Fuel Cell Gauge
+
 // I2C pins
 #define SDA 26
 #define SCL 27
 
-// MAX17055 Battery Fuel Cell Gauge
 MAX17055 max17055;
 
 // Timer to write SOC data on a specified periodic (ms)
@@ -125,7 +130,26 @@ volatile bool transmit_complete = false;
 // Font files and touch screen calibration are stored in Flash FS
 #define FlashFS LittleFS
 
+// Touchscreen pins
+#define YP A2
+#define XM A3
+#define YM 24
+#define XP 25
+
 uint8_t screen_rotation = 1;
+
+// Touchscreen calibration values
+uint16_t TS_MINX;
+uint16_t TS_MINY;
+uint16_t TS_MAXX;
+uint16_t TS_MAXY;
+
+// Current tab index
+uint8_t current_tab_index = 0;
+
+// Reads touchscreen X,Y location and pressure
+uint8_t num_touch_samples = 2;
+TouchScreen ts = TouchScreen(XP, YP, XM, YM, num_touch_samples);
 
 // TFT library instance
 TFT_eSPI tft;
@@ -134,11 +158,15 @@ TFT_eSPI tft;
 TFT_eSprite spr = TFT_eSprite(&tft); 
 TFT_eSprite gps_time_spr = TFT_eSprite(&tft); 
 TFT_eSprite pos_spr = TFT_eSprite(&tft); 
+TFT_eSprite nmea_spr = TFT_eSprite(&tft); 
 
 // Serial1 is the serial connection to GPS receiver on GPIO pins
 
 // For the byte we read from the serial port
 byte data = 0;
+
+// Flag to indicate that a packet was sent
+volatile bool transmitted_flag = false;
 
 void setup() 
 {
@@ -175,6 +203,69 @@ void setup()
     {
         Serial.println("\nFonts found OK.");
     }
+
+    // Specify the file path
+    const char *filepath = "/ts_cal_data.txt";
+  
+    // Open the file for reading
+    File file = LittleFS.open(filepath, "r");
+    if (file) 
+    {
+        // Get the file size
+        size_t fileSize = file.size();
+      
+        // Read the entire file into a dynamically allocated buffer
+        char *buffer = (char *)malloc(fileSize + 1);  // +1 for null terminator
+      
+        if (buffer == NULL) 
+        {
+          Serial.println("Error allocating memory for the buffer.");
+          file.close();
+          return;
+        }
+      
+        size_t bytesRead = file.read((uint8_t *)buffer, fileSize);
+      
+        // Null-terminate the buffer
+        buffer[bytesRead] = '\0';
+      
+        // Close the file
+        file.close();
+      
+        Serial.print("Read ");
+        Serial.print(bytesRead);
+        Serial.print(" bytes from LittleFS for touch screen calibration: ");
+        Serial.println(buffer);
+      
+        // Allocate memory
+        free(buffer);
+    
+        if (bytesRead > 10)
+        {
+            // Parse touchscreen calibration data
+            char *ptr = NULL;
+            ptr = strtok(buffer,",");
+            TS_MINX = atoi(ptr);
+            
+            ptr = strtok(NULL, ",");
+            TS_MINY = atoi(ptr);
+            
+            ptr = strtok(NULL, ",");
+            TS_MAXX = atoi(ptr);
+            
+            ptr = strtok(NULL, ",");
+            TS_MAXY = atoi(ptr);
+        }
+    }
+    // If file does not exist, then run calibration and create file
+    else
+    {
+        Serial.println(" => No such file, run calibration");
+        file.close();
+        calibrateTouchscreen();
+    }
+
+    current_tab_index = 0;
 
      // Initialze library to program SkyTraq
     program_skytraq.init(Serial1);
@@ -215,7 +306,7 @@ void setup()
                                    msg_body,
                                    msg_body_length);
     delay(250);
-
+    
     // Configure RTCM measurement data output (0x20)
     uint8_t rtcm_payload_length[]={0x00, 0x11};
     int rtcm_payload_length_length = 2;
@@ -298,7 +389,7 @@ void setup()
   
     // Set the function that will be called
     // when packet transmission is finished
-    radio->setPacketSentAction(transmissionFinished);
+    radio->setPacketSentAction(setFlag);
 
     // Transmit initial dummy data
     uint8_t byteArr[250] = {0x00};
@@ -306,7 +397,20 @@ void setup()
 
     Serial.println("Setup Complete");
 
-    // Display TFT page
+}
+
+void loop()
+{
+
+    if (current_tab_index == 0)
+    {
+        homeTab();
+    }
+  
+}
+
+void homeTab()
+{
     tft.init();
     screen_rotation = 1;
     tft.setRotation(screen_rotation);
@@ -327,10 +431,9 @@ void setup()
     // Load font
     tft.loadFont(AA_FONT_MED, LittleFS);
     
-    tft.drawString("Lat:", 3, 24);
-    tft.drawString("Lon:", 3, 44);
-    tft.drawString("Alt:", 3, 64);
-    tft.drawString("Mode:", 3, 84);
+    tft.drawString("Voltage:", 3, 24);
+    tft.drawString("Current:", 3, 44);
+    tft.drawString("Battery:", 3, 64);
     tft.drawString("LoRa Bytes Sent:", 3, 147);
 
     tft.setTextColor(TFT_WHITE, TFT_PURPLE);
@@ -365,40 +468,44 @@ void setup()
     gps_time_spr.loadFont(AA_FONT_SMALL, LittleFS);
     gps_time_spr.setTextColor(TFT_BLACK, TFT_WHITE);
 
-}
-
-void loop()
-{
-
-    // Read serial buffer and store in a large array
-    if (Serial1.available())
+    // Break out when the tab index changes, otherwise update data on home tab
+    current_tab_index = 0;
+    while (current_tab_index == 0)
     {
-        readSerialBuffer();
-    }
 
-    // If there is complete data to transmit, then break up the data into 
-    // LoRa packets and transmit over radio
-    if (data_avail)
-    {
-        decomponseAndSendData();
-    }
+        uint16_t read_data_length = 0;
+        // Read serial buffer and store in a large array
+        if (Serial1.available())
+        {
+            read_data_length = readSerialBuffer();
+        }
+    
+        // If there is complete data to transmit and the previous transmission is 
+        // complete, then break up the data into LoRa packets and transmit over radio
+        if (data_avail && transmitted_flag)
+        {
+            decomponseAndSendData(read_data_length);
+        }
 
-    unsigned long current_time = millis();
+        unsigned long current_time = millis();
 
-    // Periodically write SOC data to ESP32
-    if (current_time > last_soc_time + soc_periodic || last_soc_time > current_time)
-    { 
-        //Serial.println(millis());
-        readAndSendSOC();
-        last_soc_time = current_time;
+        // Periodically write SOC data to ESP32
+        if (current_time > last_soc_time + soc_periodic || last_soc_time > current_time)
+        { 
+            readAndSendSOC();
+            last_soc_time = current_time;
+        }
     }
     
+    tft.unloadFont();
+    gps_time_spr.unloadFont();
+    pos_spr.unloadFont();
+
 }
 
 // Read serial buffer into a large array
-void readSerialBuffer ()
+uint16_t readSerialBuffer ()
 {
-
     // Position through current packet
     int input_pos = 0;
 
@@ -416,10 +523,10 @@ void readSerialBuffer ()
     last_read_time = millis();
 
     // If serial data is still available or data was recently received
-    // This loops through all data in a burst, bursts are 1000 milliseconds apart and take <<500 milliseconds
-    while (Serial1.available() || (millis() - last_read_time) < 50)
+    // This loops through all data in a burst, bursts are 1000 milliseconds apart
+    while (Serial1.available () || (millis() - last_read_time) < 10)
     {
-        if (Serial1.available())
+        if (Serial1.available ())
         {
             // Read data from serial
             in_byte = Serial1.read();
@@ -432,38 +539,71 @@ void readSerialBuffer ()
             data_avail = true;
         }
     }
-
-    data_length = input_pos;
-    Serial.print("Read new data: data_length = ");Serial.println(data_length);
+    if (data_avail)
+    {
+        Serial.println("-----------------------------------------");
+        Serial.print("Read new data: data_length = ");Serial.println(input_pos);
+        return input_pos;
+    }
+    else
+    {
+        return 0;
+    }
 }
 
 // Transmit available data over radio
-void decomponseAndSendData ()
+void decomponseAndSendData (uint16_t read_data_length)
 {
 
-    int data_counter = 0;
-    uint8_t rtcm_data_to_send[MAX_PACKET_LENGTH];
+    uint8_t rtcm_data_to_send[MAX_PACKET_LENGTH] = {0};
 
-    // Loop over all data and break into LoRa sized packets if needed
-    for (int i=0;i<data_length;i++)
+    char last_rtcm_char = 0;
+
+    unsigned int message_index = 0;
+
+    // Loop over all data break into separate RTCM messages
+    for (int i=0;i<read_data_length;i++)
     {
-        // Store data into an array to send
-        if (data_counter < 250)
-        {
-            rtcm_data_to_send[data_counter] = rtcm_data[i];
-            data_counter++;
-        }
-        
-        // Decide to send data
-        if (data_counter == MAX_PACKET_LENGTH || i == data_length-1)
-        {
-            Serial.print("Sending data to radio. ");Serial.print("data_length = ");Serial.print(data_length);
-            Serial.print(" data_counter = ");Serial.print(data_counter);Serial.print(" i = ");Serial.println(i);
-            sendTransmission(rtcm_data_to_send, data_counter);
-            data_counter = 0;
-        }
-    }
+        // Read data into message to send
+        rtcm_data_to_send[message_index] = rtcm_data[i];
 
+        // End of data set
+        if(i == read_data_length-1)
+        {
+            sendTransmission(rtcm_data_to_send, message_index+1);
+            Serial.println();Serial.print("End of data buffer, sending ");Serial.println(message_index+1);
+            message_index = 0;
+        }
+        // Max size of a Lora message
+        else if (message_index == MAX_PACKET_LENGTH-3)
+        {
+            sendTransmission(rtcm_data_to_send, message_index+1);
+            Serial.println();Serial.print("Filled LoRa buffer, sending ");Serial.println(message_index+1);
+            message_index = 0;
+        }
+        // New message start
+        else if (i>2 && (last_rtcm_char == 0XD3 && rtcm_data_to_send[message_index] == 0X00))
+        {
+            // Message ended two data points ago
+            sendTransmission(rtcm_data_to_send, message_index-1);
+            Serial.println();Serial.print("End of message found, sending ");Serial.println(message_index-1);
+
+            // Start the next message
+            rtcm_data_to_send[0] = 0XD3;
+            rtcm_data_to_send[1] = 0X00;
+
+            message_index = 2;
+        }
+        else
+        {
+            // Save previous value and increment message index
+            last_rtcm_char = rtcm_data_to_send[message_index];
+            message_index++;      
+        }
+
+
+    }
+    
     // All data sent, no data available
     data_avail = false;
 }
@@ -471,19 +611,51 @@ void decomponseAndSendData ()
 void sendTransmission(uint8_t data_to_send[MAX_PACKET_LENGTH], int data_length)
 {
 
-    // Block here until the last packet is sent
-    while (!transmit_complete)
+    // Block while waiting for last transmission to complete
+    while(!transmitted_flag)
+        delay(1);
+
+    // Print results
+    if (transmission_state == RADIOLIB_ERR_NONE) 
     {
-        Serial.println("Block until last transmission finishes");
-        delay(10);
+        // Packet was successfully sent 
+        if (DEBUG)
+            Serial.println(F("transmission finished!"));
+    } 
+    else 
+    {
+        Serial.print(F("Transmission failure, code "));Serial.println(transmission_state);
+    }
+    
+    // Clean up after transmission is finished
+    // this will ensure transmitter is disabled,
+    // RF switch is powered down etc.
+    radio->finishTransmit();
+
+    // Add checksum to the end of the message
+    uint16_t checksum = calcCRC16(data_to_send,data_length);
+    data_to_send[data_length] = (uint8_t)(checksum >> 8);
+    data_to_send[data_length+1] = (uint8_t)(checksum & 0xFF);
+    if (DEBUG)
+    {
+        Serial.println(data_to_send[data_length],HEX);
+        Serial.println(data_to_send[data_length+1],HEX);
+        Serial.print("Checksum = ");Serial.println(checksum);
     }
 
-    // Reset transmission flag
-    transmit_complete = false;
+    data_length += 2;
+
+    for (int i=0;i<data_length-2;i++)
+    {
+        Serial.print(data_to_send[i],HEX);Serial.print(" ");
+    }
+    Serial.println("");
 
     // Start transmission of new data
     transmission_state = radio->startTransmit(data_to_send,data_length);
-    Serial.print("Transmitting pack of length ");Serial.println(data_length);
+    if (DEBUG)
+        Serial.print("Transmitting pack of length ");Serial.println(data_length);
+
     pos_spr.unloadFont();
     pos_spr.setColorDepth(16);
     pos_spr.loadFont(AA_FONT_MED, LittleFS);
@@ -491,32 +663,281 @@ void sendTransmission(uint8_t data_to_send[MAX_PACKET_LENGTH], int data_length)
     tft.setCursor(170, 147);
     pos_spr.printToSprite("  " + (String)data_length + "  ");
 
+    // Reset transmission flag
+    transmitted_flag = false;
 }
 
-// Void type function with no arguements called when a complete packet
-// is transmitted by the module
-void transmissionFinished(void) 
+void calibrateTouchscreen()
 {
-    // Indicate a packet was sent
-    transmit_complete = true;
+    // Set screen rotation
+    screen_rotation = 1;
+    tft.setRotation(screen_rotation);
 
-    // Print results
-    if (transmission_state == RADIOLIB_ERR_NONE) 
+    // Prepare screen
+    tft.fillScreen(TFT_WHITE);
+    tft.setSwapBytes(true);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextDatum(TL_DATUM);
+
+    // Load small font
+    tft.loadFont(AA_FONT_MED, LittleFS);
+
+    // Initialize calibration values
+    TS_MINX = 9999;
+    TS_MINY = 9999;
+    TS_MAXX = 0;
+    TS_MAXY = 0;
+
+    // Draw initial screen
+    tft.fillRect(0,0,10,10,TFT_RED);
+    tft.fillRect(310,0,10,10,TFT_RED);
+    tft.fillRect(0,230,10,10,TFT_RED);
+    tft.fillRect(310,230,10,10,TFT_RED);
+
+    tft.drawString("Screen Calibration:", 40, 60);
+    tft.drawString("Press corners in any order", 40, 80);
+    tft.drawString("multiple times starting in", 40, 100);
+
+    // Switch to larger font for count down timer
+    tft.unloadFont();
+    spr.setColorDepth(16);
+    spr.loadFont(AA_FONT_LARGE, LittleFS);
+    spr.setTextColor(TFT_BLACK, TFT_WHITE);
+
+    // Middle of the screen
+    int mid_x = tft.width() / 2;
+
+    unsigned long start_time = millis();
+
+    // Display countdown timer
+    int count_down_millis = 5000;
+    tft.setCursor(mid_x-30, 150);
+    while (millis() < start_time + count_down_millis)
     {
-        // Packet was successfully sent
-        Serial.println("Last transmission finished!");
-        Serial.println("----------------------------------");
-    } 
-    else 
-    {
-        Serial.print(F("Failed, code "));Serial.println(transmission_state);
-        Serial.println("----------------------------------");
+        int count_down = (int)ceil((count_down_millis - (millis() - start_time))/1000);
+        spr.printToSprite(" " + (String)count_down + " ");
+        delay(100);
     }
+
+    // Draw calibration background
+    tft.fillScreen(TFT_WHITE);
+    int mid_y = (tft.height() / 2)-50;
+    tft.pushImage (mid_x-50, mid_y-60, 105, 115, TBR_Logo);
+    tft.fillRoundRect(mid_x+35, mid_y+50, 20, 5, 5, TFT_WHITE);
+    tft.fillRect(0,0,10,10,TFT_RED);
+    tft.fillRect(310,0,10,10,TFT_RED);
+    tft.fillRect(0,230,10,10,TFT_RED);
+    tft.fillRect(310,230,10,10,TFT_RED);
+
+    // Count down number location
+    spr.setTextDatum(TC_DATUM);
+
+    tft.setCursor(mid_x-40, 150);
+
+    count_down_millis = 20000;
+    start_time = millis();
+    int points_selected = 0;
+
+    // Take points for duration milliseconds
+    while ((millis() < start_time + count_down_millis) || points_selected < 15)
+    { 
+        TSPoint p = ts.getPoint();
+        if (p.z > 250) 
+        {
+
+            TS_MINX = min(p.x,TS_MINX);
+            TS_MINY = min(p.y,TS_MINY);
+            TS_MAXX = max(p.x,TS_MAXX);
+            TS_MAXY = max(p.y,TS_MAXY);
+            Serial.print("X = ");Serial.print(p.x);
+            Serial.print(" Y = ");Serial.print(p.y);
+            Serial.print(" Z = ");Serial.println(p.z);
+            tft.fillRect(0,0,10,10,TFT_BLUE);
+            tft.fillRect(310,0,10,10,TFT_BLUE);
+            tft.fillRect(0,230,10,10,TFT_BLUE);
+            tft.fillRect(310,230,10,10,TFT_BLUE);
+            delay(200);
+            tft.fillRect(0,0,10,10,TFT_RED);
+            tft.fillRect(310,0,10,10,TFT_RED);
+            tft.fillRect(0,230,10,10,TFT_RED);
+            tft.fillRect(310,230,10,10,TFT_RED);
+            points_selected++;
+        }
+        int count_down = (int)ceil((count_down_millis - (millis() - start_time))/1000);
+
+        if (millis() < start_time + count_down_millis)
+        {
+            spr.printToSprite("  " + (String)(count_down) + "  ");
+        }
+        else
+        {
+            spr.unloadFont();
+            spr.loadFont(AA_FONT_MED, LittleFS);
+            tft.setCursor(0, 150);
+            spr.printToSprite("  Press Each Corner  ");
+        }
+    }
+  
+    Serial.print("Min X = ");Serial.println(TS_MINX);
+    Serial.print("Min Y = ");Serial.println(TS_MINY);
+    Serial.print("Max X = ");Serial.println(TS_MAXX);
+    Serial.print("Max Y = ");Serial.println(TS_MAXY);
+
+    char data[100] = {0};
+    char TS_MINX_char[20];
+    char TS_MINY_char[20];
+    char TS_MAXX_char[20];
+    char TS_MAXY_char[20];
+    char comma_char[2] =",";
+    itoa(TS_MINX,TS_MINX_char,10);
+    itoa(TS_MINY,TS_MINY_char,10);
+    itoa(TS_MAXX,TS_MAXX_char,10);
+    itoa(TS_MAXY,TS_MAXY_char,10);
+    strcpy(data,TS_MINX_char);
+    strcat(data,comma_char);
+    strcat(data,TS_MINY_char);
+    strcat(data,comma_char);
+    strcat(data,TS_MAXX_char);
+    strcat(data,comma_char);
+    strcat(data,TS_MAXY_char);
+
+    const char *filepath = "/ts_cal_data.txt";
+
+    // Open or create the file for writing
+    File file = LittleFS.open(filepath, "w");
+    if (!file) 
+    {
+        Serial.println("Error opening file for writing.");
+        return;
+    }
+  
+    // Write a character array to the file
+    size_t bytesWritten = file.write((const uint8_t *)data, strlen(data));
+  
+    if (bytesWritten != strlen(data)) 
+    {
+        Serial.println("Calibration file failed to open, using temporary values");
+        file.close();
+        return;
+    }
+  
+    // Close the file
+    file.close();
+
+    testTouchscreen();
+
+    tft.unloadFont();
+    spr.unloadFont();
+
+}
+
+void testTouchscreen()
+{
+
+      screen_rotation = 1;
+    tft.setRotation(screen_rotation);
     
-    // Clean up after transmission is finished
-    // this will ensure transmitter is disabled,
-    // RF switch is powered down etc.
-    radio->finishTransmit();
+    tft.fillScreen(TFT_WHITE);
+    
+    tft.setSwapBytes(true);
+
+    // Set the font colour and the background colour
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+    tft.loadFont(AA_FONT_MED, LittleFS);
+    
+    tft.drawString("Try it!! Tap the ball", 80, 100);
+
+    delay(2000);
+    
+    tft.fillScreen(TFT_WHITE);
+
+    bool point_drawn = false;
+
+    int point_found = 0;
+
+    while(point_found < 10)
+    {
+        if(!point_drawn)
+        {
+          tft.fillSmoothCircle(random(320), random(240), 10, TFT_PURPLE, TFT_PURPLE);
+          point_drawn = true;
+        }
+
+        // Look for touchscreen touch
+        TSPoint p = ts.getPoint();
+
+        if (p.z > 250) 
+        {
+
+            int x = getTouchX(p);
+            int y = getTouchY(p);
+
+            Serial.print("p.y/x = "); Serial.print(p.y);Serial.print(" ");Serial.print(x);
+            Serial.print(" p.x/y = "); Serial.print(p.x);Serial.print(" ");Serial.println(y);
+            tft.fillSmoothCircle(x, y, 5, TFT_BLUE, TFT_BLUE);
+
+            point_found++;
+            point_drawn = false;
+
+            delay(2000);
+            tft.fillScreen(TFT_WHITE);
+        }
+    }
+
+    tft.unloadFont();
+    spr.unloadFont();
+
+}
+
+int getTouchY(TSPoint p)
+{
+    if (screen_rotation == 1)
+    {
+        int y = constrain(p.x, TS_MINY, TS_MAXY);
+        y = map(y, TS_MINY, TS_MAXY, 0, tft.height());
+        return y;
+    }
+    else if (screen_rotation == 0)
+    {
+        int y = constrain(p.y, TS_MINY, TS_MAXY);
+        y = tft.height() - map(y, TS_MINY, TS_MAXY, 0, tft.height());
+        return y;
+    }
+    else
+    {
+        Serial.println("Undefined screen rotation");
+        return 0;
+    }
+}
+
+int getTouchX(TSPoint p)
+{
+    if (screen_rotation == 1)
+    {
+        int x = constrain(p.y, TS_MINY, TS_MAXY);
+        x = tft.width() - map(x, TS_MINY, TS_MAXY, 0, tft.width());
+        return x;
+    }
+    else if (screen_rotation == 0)
+    {
+        int x = constrain(p.x, TS_MINY, TS_MAXY);
+        x = tft.width() -map(x, TS_MINY, TS_MAXY, 0, tft.width());
+        return x;
+    }
+    else
+    {
+        Serial.println("Undefined screen rotation");
+        return 0;
+    }
+}
+
+// Void type function iwth no arguements called when a complete packet
+// is transmitted by the module
+void setFlag(void) 
+{
+  // Indicate a packet was sent
+  transmitted_flag = true;
 }
 
 // Read and send state of charge (SOC) data to ESP32
@@ -533,6 +954,17 @@ void readAndSendSOC()
     dataForTinkerSend.SOC = max17055.getSOC();
     dataForTinkerSend.temperature = max17055.getTemp();
 
+    pos_spr.unloadFont();
+    pos_spr.setColorDepth(16);
+    pos_spr.loadFont(AA_FONT_MED, LittleFS);
+    pos_spr.setTextColor(TFT_BLUE, TFT_WHITE);
+    tft.setCursor(90, 24);
+    pos_spr.printToSprite("  " + (String)dataForTinkerSend.voltage + "  ");
+    tft.setCursor(90, 44);
+    pos_spr.printToSprite("  " + (String)dataForTinkerSend.current + "  ");
+    tft.setCursor(90, 64);
+    pos_spr.printToSprite("  " + (String)dataForTinkerSend.SOC + "  ");
+
     if (DEBUG)
     {
         Serial.println("");
@@ -547,7 +979,6 @@ void readAndSendSOC()
         Serial.print("Temperature: ");Serial.println(dataForTinkerSend.temperature);
         Serial.println("------------------------------------------------------------");
     }
-
     uint16_t sendSize = 0;
 
     // Send data to TinkerSend radio using serial connection
@@ -562,7 +993,7 @@ bool autoSetBaudRate()
     // This loop will detect the current baud rate of the GNSS receiver
     // by sending a message and determining which buad rate returns a valid
     // ACK message
-    int valid_baud_rates[9] = {4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600}; 
+    int valid_baud_rates[10] = {115200, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600}; 
     
     // A character array for one block of GNSS data
     uint8_t serial_data[2500];
@@ -579,7 +1010,7 @@ bool autoSetBaudRate()
     int res_msg_body_length = 1;
 
     // Loop through possible baud rates
-    for (int i=0;i<9;i++)
+    for (int i=0;i<10;i++)
     {
         // Open the serial connection to the receiver
         Serial1.begin(valid_baud_rates[i]);
