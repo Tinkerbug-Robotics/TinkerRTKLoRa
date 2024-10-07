@@ -1,23 +1,35 @@
-/**
- * Firmware for ESP32 running on the basestation with correction data sent directly over LoRa.
- * This firmware displays information about the RTK solution and data used on a webpage,
- * which is available on the ESP32's IP address (printed to serial at startup).
- * Copyright Tinkerbug Robotics 2023
- * Provided under GNU GPL 3.0 License
- */
+/**********************************************************************
+*
+* Copyright (c) 2024 Tinkerbug Robotics
+*
+* This program is free software: you can redistribute it and/or modify it under the terms
+* of the GNU General Public License as published by the Free Software Foundation, either
+* version 3 of the License, or (at your option) any later version.
+* 
+* This program is distributed in the hope that it will be useful, but WITHOUT ANY
+* WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A 
+* PARTICULAR PURPOSE. See the GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License along with this 
+* program. If not, see <https://www.gnu.org/licenses/>.
+* 
+* Authors: 
+* Christian Pedersen; tinkerbug@tinkerbugrobotics.com
+* 
+**********************************************************************/
 
 // Libraries
 #include <map> // Standard C++ library
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#include "SoftwareSerial.h"
-#include "SerialTransfer.h"
+#include <SoftwareSerial.h>
+#include <SerialTransfer.h>
 #include <TimeLib.h>
 #include <Adafruit_NeoPixel.h>
-#include <esp_task_wdt.h>
-#include "ParseRTCM.h"
 #include <math.h>
+
+#include "ParseRTCM.h"
 
 // Local files
 #include "inputs.h"
@@ -26,9 +38,6 @@
 #include "rtk.h"
 #include "map.h"
 #include "gnss.h"
-
-// ESP32 watch dog timer (s)
-#define WDT_TIMEOUT 10
 
 // RTCM parsing variables
 PARSERTCM rtcm_parser;
@@ -80,17 +89,13 @@ String survey_complete_string = "Incomplete";
 // Called once on startup
 void setup() 
 {
-    // Enable ESP32 watch dog timer and add the curent thread to it
-    // The watch dog timer resets the ESP32 if there are any unhandled
-    // exceptions that cause the ESP32 to hang.
-    esp_task_wdt_init(WDT_TIMEOUT, true);
-    esp_task_wdt_add(NULL);
     
     // USB serial connection
     Serial.begin(115200);
-    Serial.println("Serial Open");
+    delay(500);
     //while (!Serial){}; // Pauses till serial starts. TODO: Remove if running apart from computer
-    
+    Serial.println("Serial Open");
+
     // Initialize NeoPixel
     pixels.begin();
     pixels.clear();
@@ -183,10 +188,6 @@ void setup()
 void loop() 
 {
 
-    // Tell the watch dog timer the thread is still alive
-    // so that the hardware doesn't reset
-    esp_task_wdt_reset();
-
     // Receive serial data from TinkerCharge via RP2040 if available
     if (transferFromNav.available())
     {
@@ -274,24 +275,20 @@ void loop()
 // Connect to WiFi
 void connectWiFi() 
 {
-    int try_count = 0;
-    while ( WiFi.status() != WL_CONNECTED )
+    if (WiFi.status() != WL_CONNECTED)
     {
-        try_count++;
         WiFi.disconnect();
-        WiFi.mode(WIFI_STA);
+        delay(500);
         WiFi.begin( ssid, password );
-        if ( try_count == 10 )
+
+        while ( WiFi.status() != WL_CONNECTED )
         {
-          ESP.restart();
+            Serial.print('.');
+            delay(1000);
         }
-        Serial.print('.');
-        delay(1000);
-        if(WiFi.status() == WL_CONNECTED)
-        {
-            Serial.print(" IP Address: ");Serial.println(WiFi.localIP());
-            Serial.print("The MAC address for this board is: ");Serial.println(WiFi.macAddress());
-        }
+        Serial.println();
+        Serial.print(" IP Address: ");Serial.println(WiFi.localIP());
+        Serial.print("The MAC address for this board is: ");Serial.println(WiFi.macAddress());
     }
 }
 
