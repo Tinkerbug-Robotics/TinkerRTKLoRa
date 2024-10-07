@@ -1,27 +1,58 @@
+/**********************************************************************
+*
+* Copyright (c) 2024 Tinkerbug Robotics
+*
+* This program is free software: you can redistribute it and/or modify it under the terms
+* of the GNU General Public License as published by the Free Software Foundation, either
+* version 3 of the License, or (at your option) any later version.
+* 
+* This program is distributed in the hope that it will be useful, but WITHOUT ANY
+* WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A 
+* PARTICULAR PURPOSE. See the GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License along with this 
+* program. If not, see <https://www.gnu.org/licenses/>.
+* 
+* Authors: 
+* Christian Pedersen; tinkerbug@tinkerbugrobotics.com
+* 
+**********************************************************************/
+
 /**
  * Firmware for RP2040 running on the base station which reads RTCM correction data from the 
  * GNSS receiver and sends it to the LoRa radio. This firmware also reads data from TinkerCharge 
- * and makes it available to the ESP32 to display on a webpage. Finally, the firmware also outputs GNSS serial data
- * to the RP2040 USB serial port.
- * !!! Note this must be compiled with the Earle Philhower RP2040 board set !!!
- * This is becuase it uses software serial to communicate to the ESP32. Hardware serial is
+ * and makes it available to the ESP32 to display on a webpage. 
+ *
+ * Note this must be compiled with the Earle Philhower RP2040 board set. This is
+ * becuase it uses software serial to communicate to the ESP32. Hardware serial is
  * used for the more time critical GNSS communications.
- * Copyright Tinkerbug Robotics 2023
+ * Copyright Tinkerbug Robotics 2024
  * Provided under GNU GPL 3.0 License
  */
 
 // !!! Note this must be compiled with the Earle Philhower RP2040 board set !!!
 
-#include "Arduino.h"
+#include <Arduino.h>
 #include <RadioLib.h>
 #include <Wire.h>
 #include "SerialTransfer.h"
 #include <SoftwareSerial.h>
-#include "pico/stdlib.h"
-#include <MAX17055_TR.h>
+#include <pico/stdlib.h>
 #include <SPI.h>
 
+#include <MAX17055_TR.h>
 #include "programSkyTraq.h"
+
+// Configuration for pins is in User_Setup.h in the TFT_eSPI library folder
+#include <TFT_eSPI.h>
+#include <TinyGPSPlus.h>
+#include <FS.h>
+#include <LittleFS.h>
+
+// Local include file
+#include "TBR_Logo.h"
+
+#define DEBUG false
 
 // Serial connection to ESP32 radio (RX, TX)
 SoftwareSerial swSerial(20, 3);
@@ -43,12 +74,11 @@ struct STRUCT
     float temperature;
 } dataForTinkerSend;
 
-// MAX17055 Battery Fuel Cell Gauge
-
 // I2C pins
 #define SDA 26
 #define SCL 27
 
+// MAX17055 Battery Fuel Cell Gauge
 MAX17055 max17055;
 
 // Timer to write SOC data on a specified periodic (ms)
@@ -85,22 +115,68 @@ bool data_avail = false;
 int data_length = 0;
 
 // Flag to indicate that a packet was sent
-volatile bool transmitted_flag = false;
+volatile bool transmit_complete = false;
+
+// Define a small font to use
+#define AA_FONT_SMALL "NotoSansKannadaBold10"
+#define AA_FONT_MED "NotoSansKannadaBold20"
+#define AA_FONT_LARGE "NotoSansKannadaBold40"
+
+// Font files and touch screen calibration are stored in Flash FS
+#define FlashFS LittleFS
+
+uint8_t screen_rotation = 1;
+
+// TFT library instance
+TFT_eSPI tft;
+
+// TFT sprite
+TFT_eSprite spr = TFT_eSprite(&tft); 
+TFT_eSprite gps_time_spr = TFT_eSprite(&tft); 
+TFT_eSprite pos_spr = TFT_eSprite(&tft); 
+
+// Serial1 is the serial connection to GPS receiver on GPIO pins
+
+// For the byte we read from the serial port
+byte data = 0;
 
 void setup() 
 {
 
-    // Pico USB Serial
     Serial.begin(115200);
-    // Pauses till serial starts. Do not use when running without a computer attached
-    // or it will pause indefinetly
     //while (!Serial){};
+    delay(2000);
+    Serial.println("Starting ...");
 
-    // GNSS input/output
-    // Uses default 0,1 (TX, RX) pins
+    // GNSS serial connection Serial1 default pins of 0 and 1
     Serial1.begin(115200);
 
-    // Initialze library to program SkyTraq
+    // Initialize TFT display
+    tft.begin();
+
+    if (!LittleFS.begin()) 
+    {
+        Serial.println("Flash FS initialization failed!");
+        while (1) yield();
+    }
+    Serial.println("Flash FS available!");
+
+    bool file_missing = false;
+    if (LittleFS.exists("/NotoSansKannadaBold20.vlw") == false) file_missing = true;
+    if (LittleFS.exists("/NotoSansKannadaBold40.vlw") == false) file_missing = true;
+  
+    if (file_missing)
+    {
+        Serial.println("\nFont file missing in file system, upload fonts using the LittleFS upload tool (Tools->Pico LitleFS Data Upload)?");
+        while(1)
+            yield();
+    }
+    else
+    {
+        Serial.println("\nFonts found OK.");
+    }
+
+     // Initialze library to program SkyTraq
     program_skytraq.init(Serial1);
 
     // GNSS input/output Serial is Serial1 using default 0,1 (TX, RX) pins
@@ -138,6 +214,24 @@ void setup()
                                    payload_length_length,
                                    msg_body,
                                    msg_body_length);
+    delay(250);
+
+    // Configure RTCM measurement data output (0x20)
+    uint8_t rtcm_payload_length[]={0x00, 0x11};
+    int rtcm_payload_length_length = 2;
+    uint8_t rtcm_msg_id[]={0x20};
+    int rtcm_msg_id_length = 1;
+    uint8_t rtcm_msg_body[]={0x01, 0x00, 0x01, 0x01, 0x00,
+                             0x01, 0x01, 0x01, 0x01, 0x0a, 
+                             0x00, 0x0a, 0x0a, 0x00, 0x02, 
+                             0x01};
+    int rtcm_msg_body_length = 16;
+    program_skytraq.sendGenericMsg(rtcm_msg_id,
+                                   rtcm_msg_id_length,
+                                   rtcm_payload_length,
+                                   rtcm_payload_length_length,
+                                   rtcm_msg_body,
+                                   rtcm_msg_body_length);
     delay(250);
 
     // Start SPI for LoRa radio
@@ -201,13 +295,10 @@ void setup()
         Serial.print(F("Failed, code "));Serial.println(state);
         while (true);
     }
-
-    // External RF switches controlled by (RX enable, TX enable)
-    //radio->setRfSwitchPins(L_RXEN, L_TXEN);
   
     // Set the function that will be called
     // when packet transmission is finished
-    radio->setPacketSentAction(setFlag);
+    radio->setPacketSentAction(transmissionFinished);
 
     // Transmit initial dummy data
     uint8_t byteArr[250] = {0x00};
@@ -215,9 +306,68 @@ void setup()
 
     Serial.println("Setup Complete");
 
+    // Display TFT page
+    tft.init();
+    screen_rotation = 1;
+    tft.setRotation(screen_rotation);
+    
+    tft.fillScreen(TFT_WHITE);
+    
+    tft.setSwapBytes(true);
+
+    tft.pushImage (205, 5, 105, 115, TBR_Logo);
+    tft.fillRoundRect(290, 115, 20, 5, 5, TFT_WHITE);
+
+    // Set the font colour and the background colour
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    
+    // Set datum to top center
+    tft.setTextDatum(TL_DATUM);
+
+    // Load font
+    tft.loadFont(AA_FONT_MED, LittleFS);
+    
+    tft.drawString("Lat:", 3, 24);
+    tft.drawString("Lon:", 3, 44);
+    tft.drawString("Alt:", 3, 64);
+    tft.drawString("Mode:", 3, 84);
+    tft.drawString("LoRa Bytes Sent:", 3, 147);
+
+    tft.setTextColor(TFT_WHITE, TFT_PURPLE);
+
+    // Scatter plot button
+    tft.fillRoundRect(3, 183, 120, 25, 3, TFT_PURPLE);
+    tft.drawString("Scatter Plot", 8, 187);
+
+    // Satellite viewer button
+    tft.fillRoundRect(125, 183, 110, 25, 3, TFT_PURPLE);
+    tft.drawString("Sat Viewer", 131, 187);
+
+    // Signals button
+    tft.fillRoundRect(237, 183, 80, 25, 3, TFT_PURPLE);
+    tft.drawString("Signals", 242, 187);
+
+    // NMEA messages button
+    tft.fillRoundRect(3, 210, 120, 25, 3, TFT_PURPLE);
+    tft.drawString("NMEA Msgs", 7, 215);
+
+    // Receiver button
+    tft.fillRoundRect(125, 210, 110, 25, 3, TFT_PURPLE);
+    tft.drawString("Settings", 140, 215);
+    
+    // Receiver settings
+    tft.fillRoundRect(237, 210, 80, 25, 3, TFT_PURPLE);
+    tft.drawString("Rcvr", 255, 215);
+
+    // GPS time sprite setup
+    gps_time_spr.unloadFont();
+    gps_time_spr.setColorDepth(16);
+    gps_time_spr.loadFont(AA_FONT_SMALL, LittleFS);
+    gps_time_spr.setTextColor(TFT_BLACK, TFT_WHITE);
+
 }
 
-void loop() 
+void loop()
 {
 
     // Read serial buffer and store in a large array
@@ -226,9 +376,9 @@ void loop()
         readSerialBuffer();
     }
 
-    // If there is complete data to transmit and the previous transmission is 
-    // complete, then break up the data into LoRa packets and transmit over radio
-    if (data_avail && transmitted_flag)
+    // If there is complete data to transmit, then break up the data into 
+    // LoRa packets and transmit over radio
+    if (data_avail)
     {
         decomponseAndSendData();
     }
@@ -238,11 +388,11 @@ void loop()
     // Periodically write SOC data to ESP32
     if (current_time > last_soc_time + soc_periodic || last_soc_time > current_time)
     { 
-        Serial.println(millis());
+        //Serial.println(millis());
         readAndSendSOC();
         last_soc_time = current_time;
     }
-
+    
 }
 
 // Read serial buffer into a large array
@@ -267,9 +417,9 @@ void readSerialBuffer ()
 
     // If serial data is still available or data was recently received
     // This loops through all data in a burst, bursts are 1000 milliseconds apart and take <<500 milliseconds
-    while (Serial1.available () || (millis() - last_read_time) < 50)
+    while (Serial1.available() || (millis() - last_read_time) < 50)
     {
-        if (Serial1.available ())
+        if (Serial1.available())
         {
             // Read data from serial
             in_byte = Serial1.read();
@@ -298,15 +448,17 @@ void decomponseAndSendData ()
     for (int i=0;i<data_length;i++)
     {
         // Store data into an array to send
-        if (data_counter <= 250)
+        if (data_counter < 250)
         {
             rtcm_data_to_send[data_counter] = rtcm_data[i];
             data_counter++;
         }
-
+        
         // Decide to send data
         if (data_counter == MAX_PACKET_LENGTH || i == data_length-1)
         {
+            Serial.print("Sending data to radio. ");Serial.print("data_length = ");Serial.print(data_length);
+            Serial.print(" data_counter = ");Serial.print(data_counter);Serial.print(" i = ");Serial.println(i);
             sendTransmission(rtcm_data_to_send, data_counter);
             data_counter = 0;
         }
@@ -319,40 +471,52 @@ void decomponseAndSendData ()
 void sendTransmission(uint8_t data_to_send[MAX_PACKET_LENGTH], int data_length)
 {
 
-    // Block while waiting for last transmission to complete
-    while(!transmitted_flag)
-        delay(1);
+    // Block here until the last packet is sent
+    while (!transmit_complete)
+    {
+        Serial.println("Block until last transmission finishes");
+        delay(10);
+    }
+
+    // Reset transmission flag
+    transmit_complete = false;
+
+    // Start transmission of new data
+    transmission_state = radio->startTransmit(data_to_send,data_length);
+    Serial.print("Transmitting pack of length ");Serial.println(data_length);
+    pos_spr.unloadFont();
+    pos_spr.setColorDepth(16);
+    pos_spr.loadFont(AA_FONT_MED, LittleFS);
+    pos_spr.setTextColor(TFT_BLUE, TFT_WHITE);
+    tft.setCursor(170, 147);
+    pos_spr.printToSprite("  " + (String)data_length + "  ");
+
+}
+
+// Void type function with no arguements called when a complete packet
+// is transmitted by the module
+void transmissionFinished(void) 
+{
+    // Indicate a packet was sent
+    transmit_complete = true;
 
     // Print results
     if (transmission_state == RADIOLIB_ERR_NONE) 
     {
         // Packet was successfully sent
-        Serial.println(F("transmission finished!"));
+        Serial.println("Last transmission finished!");
+        Serial.println("----------------------------------");
     } 
     else 
     {
         Serial.print(F("Failed, code "));Serial.println(transmission_state);
+        Serial.println("----------------------------------");
     }
     
     // Clean up after transmission is finished
     // this will ensure transmitter is disabled,
     // RF switch is powered down etc.
     radio->finishTransmit();
-
-    // Start transmission of new data
-    transmission_state = radio->startTransmit(data_to_send,data_length);
-    Serial.print("Transmitting pack of length ");Serial.println(data_length);
-
-    // Reset transmission flag
-    transmitted_flag = false;
-}
-
-// Void type function iwth no arguements called when a complete packet
-// is transmitted by the module
-void setFlag(void) 
-{
-  // Indicate a packet was sent
-  transmitted_flag = true;
 }
 
 // Read and send state of charge (SOC) data to ESP32
@@ -369,18 +533,21 @@ void readAndSendSOC()
     dataForTinkerSend.SOC = max17055.getSOC();
     dataForTinkerSend.temperature = max17055.getTemp();
 
-//    Serial.println("");
-//    Serial.print("Voltage: ");Serial.println(dataForTinkerSend.voltage);
-//    Serial.print("Avg Voltage: ");Serial.println(dataForTinkerSend.avg_voltage);
-//    Serial.print("Current: ");Serial.println(dataForTinkerSend.current);
-//    Serial.print("Avg Current: ");Serial.println(dataForTinkerSend.avg_current);
-//    Serial.print("Battery Capactity: ");Serial.println(dataForTinkerSend.battery_capacity);
-//    Serial.print("Battery Age: ");Serial.println(dataForTinkerSend.battery_age);
-//    Serial.print("Number of Cycles: ");Serial.println(dataForTinkerSend.cycle_counter);
-//    Serial.print("SOC: ");Serial.println(dataForTinkerSend.SOC);
-//    Serial.print("Temperature: ");Serial.println(dataForTinkerSend.temperature);
-//    Serial.println("------------------------------------------------------------");
-    
+    if (DEBUG)
+    {
+        Serial.println("");
+        Serial.print("Voltage: ");Serial.println(dataForTinkerSend.voltage);
+        Serial.print("Avg Voltage: ");Serial.println(dataForTinkerSend.avg_voltage);
+        Serial.print("Current: ");Serial.println(dataForTinkerSend.current);
+        Serial.print("Avg Current: ");Serial.println(dataForTinkerSend.avg_current);
+        Serial.print("Battery Capactity: ");Serial.println(dataForTinkerSend.battery_capacity);
+        Serial.print("Battery Age: ");Serial.println(dataForTinkerSend.battery_age);
+        Serial.print("Number of Cycles: ");Serial.println(dataForTinkerSend.cycle_counter);
+        Serial.print("SOC: ");Serial.println(dataForTinkerSend.SOC);
+        Serial.print("Temperature: ");Serial.println(dataForTinkerSend.temperature);
+        Serial.println("------------------------------------------------------------");
+    }
+
     uint16_t sendSize = 0;
 
     // Send data to TinkerSend radio using serial connection
